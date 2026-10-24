@@ -33,8 +33,9 @@ export class SmartMatchError extends Error {
   constructor(
     public readonly status: number,
     message: string,
+    options?: ErrorOptions,
   ) {
-    super(message);
+    super(message, options);
     this.name = "SmartMatchError";
   }
 }
