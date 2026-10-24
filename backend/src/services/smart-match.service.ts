@@ -329,6 +329,10 @@ async function generateInternal<T>(
 
   let reportedUsage: TokenUsage | null = null;
   let settled = false;
+  let stage = "provider_fetch";
+  let providerStatus: number | null = null;
+  let providerRequestId: string | null = null;
+  const startedAt = Date.now();
 
   try {
     // No automatic AI retries.
@@ -343,28 +347,35 @@ async function generateInternal<T>(
       signal: AbortSignal.timeout(30_000),
       body: JSON.stringify(body),
     });
+    providerStatus = response.status;
 
+    const requestId = response.headers?.get("x-request-id") ?? null;
+    providerRequestId =
+      requestId && /^[A-Za-z0-9_-]{1,200}$/.test(requestId) ? requestId : null;
+
+    stage = "provider_body";
     const raw: unknown =
       streaming && response.ok && onDelta
         ? await readSmartMatchStream(response, onDelta, (terminalResponse) => {
             reportedUsage = readTokenUsage(terminalResponse);
           })
         : await response.json();
-
+    stage = "read_usage";
     reportedUsage = readTokenUsage(raw);
 
     // Reported usage is accounted for even if the answer is invalid,
     // incomplete, or refused.
+    stage = "settle_budget";
     await settleBudget(leaseId, reportedUsage);
     settled = true;
-
+    stage = "provider_http";
     if (!response.ok) {
       throw new SmartMatchError(
         502,
         "AI couldn’t complete this request. Please try again later.",
       );
     }
-
+    stage = "response_validation";
     const output = responseSchema.parse(raw);
 
     if (output.status !== "completed") {
@@ -388,7 +399,13 @@ async function generateInternal<T>(
       );
     }
 
-    const value = validator.parse(JSON.parse(text) as unknown);
+    stage = "output_json";
+    const parsedText: unknown = JSON.parse(text);
+
+    stage = "output_validation";
+    const value = validator.parse(parsedText);
+
+    stage = "cache_write";
 
     // Only completed, validated answers can enter the cache.
     // Only the active lease holder can store a result.
@@ -419,12 +436,76 @@ async function generateInternal<T>(
         expires_at = EXCLUDED.expires_at
     `);
 
+    stage = "usage_lookup";
+    const usage = await usageFor(userId);
+
     return {
       value,
       cached: false,
-      usage: await usageFor(userId),
+      usage,
     };
   } catch (error) {
+    const knownErrorNames = new Set([
+      "Error",
+      "TypeError",
+      "SyntaxError",
+      "AbortError",
+      "TimeoutError",
+      "ZodError",
+      "DrizzleQueryError",
+      "NeonDbError",
+      "SmartMatchError",
+    ]);
+
+    const knownFields = new Set([
+      "skills",
+      "roles",
+      "experience",
+      "location",
+      "workMode",
+      "status",
+      "output",
+      "type",
+      "content",
+      "text",
+    ]);
+
+    const errorType =
+      error instanceof Error && knownErrorNames.has(error.name)
+        ? error.name
+        : "UnknownError";
+
+    // Do not log issue messages, input values, or unrestricted paths.
+    const validationIssues =
+      error instanceof z.ZodError
+        ? error.issues.slice(0, 10).map((issue) => {
+            const field = issue.path[0];
+
+            return {
+              code: issue.code,
+              field:
+                typeof field === "string" && knownFields.has(field)
+                  ? field
+                  : "other",
+            };
+          })
+        : undefined;
+
+    console.error(
+      JSON.stringify({
+        timestamp: new Date().toISOString(),
+        level: "error",
+        event: "smart_match_generation_failed",
+        operation: kind,
+        stage,
+        durationMs: Date.now() - startedAt,
+        providerStatus,
+        providerRequestId,
+        errorType,
+        validationIssues,
+      }),
+    );
+
     if (error instanceof SmartMatchError) {
       throw error;
     }
@@ -432,6 +513,7 @@ async function generateInternal<T>(
     throw new SmartMatchError(
       502,
       "AI couldn’t complete this request. Your saved profile is unchanged.",
+      { cause: error },
     );
   } finally {
     try {
